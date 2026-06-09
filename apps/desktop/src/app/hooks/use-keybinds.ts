@@ -25,7 +25,7 @@ import {
   switchToDefaultProfile,
   toggleShowAllProfiles
 } from '@/store/profile'
-import { $activeSessionId, $sessions, setModelPickerOpen } from '@/store/session'
+import { $selectedStoredSessionId, $sessions, setModelPickerOpen } from '@/store/session'
 import { useTheme } from '@/themes/context'
 
 import { requestComposerFocus } from '../chat/composer/focus'
@@ -68,7 +68,10 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
     profileSwitchHandlers[`profile.switch.${slot}`] = () => switchProfileToSlot(slot)
   }
 
-  // Move to the adjacent session in recency order, wrapping at the ends.
+  // Adjacent session in recency order, wrapping at the ends. We locate the
+  // current row by its *stored* id (`$selectedStoredSessionId`); the runtime
+  // `$activeSessionId` never matches a `$sessions` row, so cycling by it would
+  // always restart from the edge.
   const cycleSession = (direction: 1 | -1) => {
     const sessions = $sessions.get()
 
@@ -76,7 +79,8 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
       return
     }
 
-    const current = sessions.findIndex(session => session.id === $activeSessionId.get())
+    const selectedId = $selectedStoredSessionId.get()
+    const current = selectedId ? sessions.findIndex(session => session.id === selectedId) : -1
     const start = current === -1 ? (direction === 1 ? -1 : 0) : current
     const next = sessions[(start + direction + sessions.length) % sessions.length]
 

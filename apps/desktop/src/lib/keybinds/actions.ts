@@ -58,8 +58,10 @@ export const KEYBIND_ACTIONS: readonly KeybindActionMeta[] = [
 
   // ── Session ──────────────────────────────────────────────────────────────
   { id: 'session.new', category: 'session', defaults: ['mod+n', 'shift+n'] },
-  { id: 'session.next', category: 'session', defaults: [] },
-  { id: 'session.prev', category: 'session', defaults: [] },
+  // ⌃Tab / ⌃⇧Tab — the universal tab-cycle chord. Literally Control, not Cmd
+  // (macOS reserves Cmd+Tab for app switching); see `ctrl` in combo.ts.
+  { id: 'session.next', category: 'session', defaults: ['ctrl+tab'] },
+  { id: 'session.prev', category: 'session', defaults: ['ctrl+shift+tab'] },
   { id: 'session.focusSearch', category: 'session', defaults: ['mod+shift+f'] },
   { id: 'session.togglePin', category: 'session', defaults: [] },
 
