@@ -2370,6 +2370,12 @@ def _sync_session_key_after_compress(
 
 
 def _get_usage(agent) -> dict:
+    if agent is None:
+        return {
+            "model": "",
+            "input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
+            "reasoning": 0, "prompt": 0, "completion": 0, "total": 0, "calls": 0,
+        }
     g = lambda k, fb=None: getattr(agent, k, 0) or (getattr(agent, fb, 0) if fb else 0)
     usage = {
         "model": getattr(agent, "model", "") or "",
@@ -2393,7 +2399,7 @@ def _get_usage(agent) -> dict:
             usage["context_percent"] = max(0, min(100, round(ctx_used / ctx_max * 100)))
         usage["compressions"] = getattr(comp, "compression_count", 0) or 0
     try:
-        from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+        from agent.usage_pricing import CanonicalUsage, estimate_usage_cost, get_pricing_entry
 
         cost = estimate_usage_cost(
             usage["model"],
@@ -2409,8 +2415,61 @@ def _get_usage(agent) -> dict:
         usage["cost_status"] = cost.status
         if cost.amount_usd is not None:
             usage["cost_usd"] = float(cost.amount_usd)
+        # Active model pricing (per-million-token rates for dynamic display)
+        entry = get_pricing_entry(
+            usage["model"],
+            provider=getattr(agent, "provider", None),
+            base_url=getattr(agent, "base_url", None),
+        )
+        if entry:
+            usage["pricing_input_rate"] = float(entry.input_cost_per_million) if entry.input_cost_per_million is not None else None
+            usage["pricing_output_rate"] = float(entry.output_cost_per_million) if entry.output_cost_per_million is not None else None
     except Exception:
         pass
+    # ── Provider quota / rate-limit reset ──────────────────────────
+    # Dual-source: account_usage API (Z.AI, Anthropic, OpenRouter, Nous,
+    # Codex) → rate_limit_tracker headers (Groq, Mistral).  Mirrors the
+    # CLI status bar logic in HermesCLI._build_status_snapshot().
+    if usage.get("total", 0) > 0:
+        try:
+            _provider_name = getattr(agent, "provider", None) or ""
+            _base_url = getattr(agent, "base_url", None)
+            _api_key = getattr(agent, "api_key", None)
+            from agent.account_usage import fetch_account_usage
+            _acct = fetch_account_usage(
+                _provider_name, base_url=_base_url, api_key=_api_key,
+            )
+            if _acct and _acct.available:
+                _best = None  # most-constrained window
+                for _w in _acct.windows:
+                    if _w.used_percent is not None:
+                        if _best is None or _w.used_percent > _best[0]:
+                            _best = (_w.used_percent, _w.reset_at)
+                if _best:
+                    usage["quota_pct"] = round(_best[0])
+                    if _best[1]:
+                        from datetime import datetime, timezone
+                        _now = datetime.now(timezone.utc)
+                        _reset = _best[1] if _best[1].tzinfo else _best[1].replace(tzinfo=timezone.utc)
+                        _secs = max(0, (_reset - _now).total_seconds())
+                        if _secs > 0:
+                            h, rem = divmod(int(_secs), 3600)
+                            m, s = divmod(rem, 60)
+                            usage["quota_reset"] = f"{h}h{m}m"
+                    else:
+                        usage["quota_reset"] = "see /usage"
+            else:
+                from agent.rate_limit_tracker import format_rate_limit_compact
+                _rl = agent.get_rate_limit_state() if hasattr(agent, "get_rate_limit_state") else None
+                if _rl and any(b.remaining is not None and b.limit is not None and b.limit > 0 for b in [
+                    _rl.requests_min, _rl.requests_hour, _rl.tokens_min, _rl.tokens_hour
+                ]):
+                    _rl_text = format_rate_limit_compact(_rl)
+                    if _rl_text and "No rate" not in _rl_text:
+                        usage["quota_rl_text"] = _rl_text
+        except Exception:
+            pass
+
     # Dev-only live credits-spent readout (L0 usage-aware-credits). Gated on
     # HERMES_DEV_CREDITS so the payload stays clean when the flag is off.
     if is_truthy_value(os.environ.get("HERMES_DEV_CREDITS")):

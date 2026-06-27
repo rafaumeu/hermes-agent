@@ -41,7 +41,7 @@ from collections import deque
 from urllib.parse import unquote, urlparse
 from contextlib import contextmanager
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -3241,6 +3241,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self.bell_on_complete = CLI_CONFIG["display"].get("bell_on_complete", False)
         # show_reasoning: display model thinking/reasoning before the response
         self.show_reasoning = CLI_CONFIG["display"].get("show_reasoning", False)
+        # show_cost: display estimated session cost in the status bar
+        self.show_cost = bool(CLI_CONFIG["display"].get("show_cost", False))
         _configure_output_history(
             enabled=CLI_CONFIG["display"].get("persistent_output", True),
             max_lines=CLI_CONFIG["display"].get("persistent_output_max_lines", 200),
@@ -3974,6 +3976,71 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             if context_length:
                 snapshot["context_percent"] = max(0, min(100, round((context_tokens / context_length) * 100)))
 
+        # ── Session cost (only when show_cost is enabled) ───────────
+        _sc = getattr(self, "show_cost", False)
+        _st = snapshot.get("session_total_tokens", 0)
+        if _sc and _st > 0:
+            try:
+                from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+                _cost = estimate_usage_cost(
+                    snapshot["model_name"],
+                    CanonicalUsage(
+                        input_tokens=snapshot["session_input_tokens"],
+                        output_tokens=snapshot["session_output_tokens"],
+                        cache_read_tokens=snapshot["session_cache_read_tokens"],
+                        cache_write_tokens=snapshot["session_cache_write_tokens"],
+                    ),
+                    provider=getattr(agent, "provider", None),
+                    base_url=getattr(agent, "base_url", None),
+                )
+                if _cost.amount_usd is not None:
+                    snapshot["cost_usd"] = float(_cost.amount_usd)
+                    snapshot["cost_status"] = _cost.status
+            except Exception:
+                pass
+
+        # ── Provider quota / rate-limit reset (all providers) ────────
+        _provider_name = getattr(agent, "provider", None) or ""
+        if snapshot.get("session_total_tokens", 0) > 0:
+            try:
+                _base_url = getattr(agent, "base_url", None)
+                _api_key = getattr(agent, "api_key", None)
+                # Source 1: account_usage.py (Z.AI, Anthropic, OpenRouter, Nous, Codex)
+                from agent.account_usage import fetch_account_usage
+                _acct = fetch_account_usage(
+                    _provider_name, base_url=_base_url, api_key=_api_key,
+                )
+                if _acct and _acct.available:
+                    _best = None  # most-constrained window
+                    for _w in _acct.windows:
+                        if _w.used_percent is not None:
+                            if _best is None or _w.used_percent > _best[0]:
+                                _best = (_w.used_percent, _w.reset_at)
+                    if _best:
+                        snapshot["quota_pct"] = round(_best[0])
+                        if _best[1]:
+                            _now = datetime.now(timezone.utc)
+                            _reset = _best[1] if _best[1].tzinfo else _best[1].replace(tzinfo=timezone.utc)
+                            _secs = max(0, (_reset - _now).total_seconds())
+                            if _secs and _secs > 0:
+                                h, rem = divmod(int(_secs), 3600)
+                                m, s = divmod(rem, 60)
+                                snapshot["quota_reset"] = f"{h}h{m}m"
+                        else:
+                            snapshot["quota_reset"] = "see /usage"
+                else:
+                    # Source 2: rate_limit_tracker (Groq, Mistral, OpenAI, etc.)
+                    from agent.rate_limit_tracker import RateLimitState, format_rate_limit_compact
+                    _rl = agent.get_rate_limit_state() if hasattr(agent, "get_rate_limit_state") else None
+                    if _rl and any(b.remaining is not None and b.limit is not None and b.limit > 0 for b in [
+                        _rl.requests_min, _rl.requests_hour, _rl.tokens_min, _rl.tokens_hour
+                    ]):
+                        _rl_text = format_rate_limit_compact(_rl)
+                        if _rl_text and "No rate" not in _rl_text:
+                            snapshot["quota_rl_text"] = _rl_text
+            except Exception:
+                pass
+
         return snapshot
 
     @staticmethod
@@ -4224,6 +4291,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 parts.append(idle_since)
             if yolo_active:
                 parts.append("⚠ YOLO")
+            # Cost — show estimated session cost when available
+            cost_usd = snapshot.get("cost_usd")
+            if cost_usd is not None:
+                if cost_usd < 0.01:
+                    cost_label = f"${cost_usd:.4f}"
+                elif cost_usd < 1.0:
+                    cost_label = f"${cost_usd:.3f}"
+                else:
+                    cost_label = f"${cost_usd:.2f}"
+                parts.append(cost_label)
+            # Provider quota / rate-limit reset
+            _q_pct = snapshot.get("quota_pct")
+            _q_reset = snapshot.get("quota_reset")
+            _q_rl_text = snapshot.get("quota_rl_text")
+            if _q_pct is not None and _q_reset:
+                parts.append(f"quota {_q_pct}% | {_q_reset}")
+            elif _q_rl_text:
+                parts.append(_q_rl_text)
             return self._trim_status_bar_text(" │ ".join(parts), width)
         except Exception:
             return f"⚕ {self.model if getattr(self, 'model', None) else 'Hermes'}"
@@ -4331,6 +4416,27 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     if yolo_active:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-yolo", "⚠ YOLO"))
+                    # Cost — estimated session cost
+                    _frag_cost_usd = snapshot.get("cost_usd")
+                    if _frag_cost_usd is not None:
+                        if _frag_cost_usd < 0.01:
+                            _frag_cost_label = f"${_frag_cost_usd:.4f}"
+                        elif _frag_cost_usd < 1.0:
+                            _frag_cost_label = f"${_frag_cost_usd:.3f}"
+                        else:
+                            _frag_cost_label = f"${_frag_cost_usd:.2f}"
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-good", _frag_cost_label))
+                    # Provider quota / rate-limit reset
+                    _fq_pct = snapshot.get("quota_pct")
+                    _fq_reset = snapshot.get("quota_reset")
+                    _fq_rl_text = snapshot.get("quota_rl_text")
+                    if _fq_pct is not None and _fq_reset:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-dim", f"quota {_fq_pct}% | {_fq_reset}"))
+                    elif _fq_rl_text:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-dim", _fq_rl_text))
                     frags.append(("class:status-bar", " "))
 
             total_width = sum(self._status_bar_display_width(text) for _, text in frags)
@@ -7504,6 +7610,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._manual_compress(cmd_original)
         elif canonical == "usage":
             self._show_usage()
+        elif canonical == "reset-cost":
+            self._reset_session_usage()
         elif canonical == "credits":
             self._show_credits()
         elif canonical == "insights":
@@ -8253,6 +8361,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             except Exception as e:
                 print(f"  ❌ Compression failed: {e}")
 
+    def _reset_session_usage(self):
+        """Reset session token counters and estimated cost to zero."""
+        if not self.agent:
+            print("(._.) No active agent -- send a message first.")
+            return
+        agent = self.agent
+        old_total = getattr(agent, "session_total_tokens", 0) or 0
+        agent.session_input_tokens = 0
+        agent.session_output_tokens = 0
+        agent.session_cache_read_tokens = 0
+        agent.session_cache_write_tokens = 0
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+        agent.session_api_calls = 0
+        agent.session_estimated_cost_usd = 0.0
+        # Also reset reasoning tokens if present
+        if hasattr(agent, "session_reasoning_tokens"):
+            agent.session_reasoning_tokens = 0
+        print(f"  ✅ Session usage reset ({old_total:,} tokens cleared)")
 
 
     def _show_usage(self):
